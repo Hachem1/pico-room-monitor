@@ -40,6 +40,7 @@ GITHUB_BRANCH = "main"
 OTA_FILES = ["main.py"]              # files to pull when you send "update"
 # ----------------------------------------
 
+
 NTFY_URL = "https://ntfy.sh/" + NTFY_TOPIC
 BOT_TITLES = ("Room conditions", "Reading (on request)", "Pico")
 
