@@ -56,8 +56,8 @@ LCD_NUM_COLS = 16
 # --- LED config ---
 LED_PIN = 2
 LED_COUNT = 15        # 15 for the strand, 12 for the ring
-TEMP_MIN = 13
-TEMP_MAX = 27
+TEMP_MIN = 18
+TEMP_MAX = 32
 
 # --- Set up hardware ---
 i2c = I2C(I2C_BUS, sda=Pin(SDA), scl=Pin(SCL), freq=400000)
