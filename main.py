@@ -1,338 +1,113 @@
-from machine import I2C, Pin
-from lcd_api import LcdApi
-from pico_i2c_lcd import I2cLcd
-from dht20 import DHT20
-from neopixel import NeoPixel
-import network
-import machine
-import time
-import json
-import gc
-import os
-import rp2
+# lcd_flip_helpers.py
+# Software 180-degree flip for HD44780 character LCDs (digits + a few symbols)
+#
+# The HD44780 has NO native rotate command - characters come from a fixed ROM
+# font that can't be addressed upside down. To make text appear right-side-up
+# when the LCD module itself is physically mounted upside down, this module:
+#
+#   1) Builds mirrored (180-degree rotated) bitmaps for the characters we
+#      need, and loads them into CGRAM (the controller's 8 custom-character
+#      slots, code points 0-7).
+#   2) Writes those custom glyphs in REVERSED column order per row, so the
+#      whole line lands correctly once the physical LCD is upside down.
+#
+# HARD LIMIT: only 8 distinct custom glyphs can be loaded at once. This
+# module tracks which glyphs are currently needed for a given line and
+# raises an error if a line needs more than 8 unique characters - so keep
+# labels short (e.g. "T" / "H" rather than "Temp:" / "Humidity:") if you
+# want them to share the budget with digits.
+#
+# Requires your lcd_api.py to expose:
+#   lcd.custom_char(location, charmap)   # loads an 8-byte bitmap into CGRAM slot 0-7
+#   lcd.putchar(ch)                      # writes one raw character/byte
+#   lcd.move_to(col, row)
+# (These are present in the common dhylands/python_lcd lcd_api.py used with
+# pico_i2c_lcd.py - the same library this project already uses.)
 
-# Credentials live in secrets.py ON THE PICO (not in this repo)
-from secrets import WIFI_SSID, WIFI_PASSWORD, NTFY_TOPIC
-
-try:
-    import urequests as requests
-except ImportError:
-    import requests
-
-try:
-    import ntptime
-except ImportError:
-    ntptime = None
-
-# ---------------- CONFIG ----------------
-NOTIFY_EVERY_MINUTES = 30
-POLL_EVERY_SECONDS = 15
-
-# Logging
-LOG_FILE = "templog.csv"
-LOG_EVERY_SECONDS = 60               # log a reading once a minute
-TZ_OFFSET_HOURS = 1                  # London: 1 in summer (BST), 0 in winter (GMT)
-
-# OTA - point these at YOUR public GitHub repo
-GITHUB_USER = "YOUR_GITHUB_USERNAME"
-GITHUB_REPO = "pico-room-monitor"
-GITHUB_BRANCH = "main"
-OTA_FILES = ["main.py"]              # files to pull when you send "update"
-# ----------------------------------------
-
-
-NTFY_URL = "https://ntfy.sh/" + NTFY_TOPIC
-BOT_TITLES = ("Room conditions", "Reading (on request)", "Pico")
-
-# --- LCD / sensor I2C config ---
-SDA = 14
-SCL = 15
-I2C_BUS = 1
-LCD_ADDR = 0x27
-TEMP_ADDR = 0x38
-LCD_NUM_ROWS = 2
-LCD_NUM_COLS = 16
-
-# --- LED config ---
-LED_PIN = 2
-LED_COUNT = 15        # 15 for the strand, 12 for the ring
-TEMP_MIN = 18
-TEMP_MAX = 32
-
-# --- Set up hardware ---
-i2c = I2C(I2C_BUS, sda=Pin(SDA), scl=Pin(SCL), freq=400000)
-lcd = I2cLcd(i2c, LCD_ADDR, LCD_NUM_ROWS, LCD_NUM_COLS)
-dht20 = DHT20(TEMP_ADDR, i2c)
-strand = NeoPixel(Pin(LED_PIN), LED_COUNT)
-wlan = network.WLAN(network.STA_IF)
-
-# --- State ---
-night_mode = False
-last_btn = 0
-last_toggle = 0
-last_cmd_time = 0
-primed = False
+# Standard 5x8 HD44780 font bitmaps, 5 active bits per byte (rows top->bottom)
+_FONT = {
+    '0': [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E, 0x00],
+    '1': [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E, 0x00],
+    '2': [0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F, 0x00],
+    '3': [0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E, 0x00],
+    '4': [0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02, 0x00],
+    '5': [0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E, 0x00],
+    '6': [0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E, 0x00],
+    '7': [0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08, 0x00],
+    '8': [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E, 0x00],
+    '9': [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C, 0x00],
+    '.': [0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C, 0x00],
+    ':': [0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00, 0x00],
+    '%': [0x19, 0x1A, 0x04, 0x04, 0x08, 0x0B, 0x13, 0x00],
+    'C': [0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E, 0x00],
+    'T': [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x00],
+    'H': [0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11, 0x00],
+    ' ': [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+}
 
 
-def connect_wifi():
-    wlan.active(True)
-    if wlan.isconnected():
-        return True
-    wlan.connect(WIFI_SSID, WIFI_PASSWORD)
-    for _ in range(20):
-        if wlan.isconnected():
-            print("WiFi connected:", wlan.ifconfig()[0])
-            return True
-        time.sleep(1)
-    print("WiFi connection failed")
-    return False
+def _flip_glyph(bitmap):
+    """180-degree rotate a 5x8 glyph: reverse row order top<->bottom, and
+    reverse the 5 active bits within each row (left<->right)."""
+    flipped = []
+    for row in reversed(bitmap):
+        mirrored = 0
+        for bit in range(5):
+            if row & (1 << bit):
+                mirrored |= (1 << (4 - bit))
+        flipped.append(mirrored)
+    return flipped
 
 
-def sync_time():
-    if ntptime is None:
-        print("ntptime not available - timestamps may be wrong")
-        return
-    try:
-        ntptime.settime()
-        print("Clock synced over the internet")
-    except Exception as e:
-        print("NTP sync failed:", e)
+class FlippedLcdWriter:
+    """
+    Dynamically manages the LCD's 8 CGRAM slots: for each line you want to
+    draw, it loads whichever flipped glyphs that line actually needs (up to
+    8 unique characters), then writes them in reverse order so the row reads
+    correctly once the physical LCD is mounted upside down.
+    """
 
+    def __init__(self, lcd, num_cols=16):
+        self.lcd = lcd
+        self.num_cols = num_cols
+        self._slot_map = {}
 
-def timestamp():
-    t = time.localtime(time.time() + TZ_OFFSET_HOURS * 3600)
-    return "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(
-        t[0], t[1], t[2], t[3], t[4], t[5])
+    def _assign_slots(self, chars_needed):
+        self._slot_map = {}
+        for slot, ch in enumerate(chars_needed):
+            self.lcd.custom_char(slot, bytearray(_flip_glyph(_FONT[ch])))
+            self._slot_map[ch] = slot
 
+    def write_flipped_row(self, text, physical_row):
+        """
+        text: the upright string you want a viewer to read, e.g. 'T 23.4C'
+        physical_row: which physical LCD row (0 or 1) to draw on. Since the
+        module is mounted upside down, what you consider your "top" logical
+        row should be sent with physical_row=1, and your "bottom" logical
+        row with physical_row=0 - swap them here, not in your own code.
+        """
+        text = text[:self.num_cols].ljust(self.num_cols)
 
-def ensure_log_header():
-    try:
-        open(LOG_FILE, "r").close()
-    except OSError:
-        with open(LOG_FILE, "w") as f:
-            f.write("timestamp,temp_c,humidity_pct\n")
+        unique_chars = []
+        for ch in text:
+            if ch != ' ' and ch not in unique_chars:
+                if ch not in _FONT:
+                    raise ValueError("No flipped glyph defined for %r" % ch)
+                unique_chars.append(ch)
 
+        if len(unique_chars) > 8:
+            raise ValueError(
+                "Row needs %d distinct glyphs (%s) but only 8 CGRAM slots "
+                "are available - shorten labels or reduce precision"
+                % (len(unique_chars), unique_chars)
+            )
 
-def log_reading(temp, humidity):
-    line = "{},{:.1f},{:.1f}\n".format(timestamp(), temp, humidity)
-    try:
-        with open(LOG_FILE, "a") as f:
-            f.write(line)
-        print("Logged:", line.strip())
-    except Exception as e:
-        print("Log failed:", e)
+        self._assign_slots(unique_chars)
 
-
-def notify_text(text, title="Pico"):
-    try:
-        if not wlan.isconnected():
-            connect_wifi()
-        r = requests.post(NTFY_URL, data=text, headers={"Title": title})
-        r.close()
-    except Exception as e:
-        print("Notify failed:", e)
-    gc.collect()
-
-
-def publish_reading(temp, humidity, title="Room conditions"):
-    notify_text("Temp: {}C   Humidity: {}%".format(temp, humidity), title)
-
-
-def get_new_command():
-    global last_cmd_time, primed
-    url = NTFY_URL + "/json?poll=1&since=" + str(POLL_EVERY_SECONDS + 10) + "s"
-    try:
-        r = requests.get(url)
-        body = r.text
-        r.close()
-    except Exception as e:
-        print("Poll failed:", e)
-        gc.collect()
-        return None
-    gc.collect()
-
-    newest = last_cmd_time
-    cmd_text = None
-    for line in body.split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            msg = json.loads(line)
-        except Exception:
-            continue
-        if msg.get("event") != "message":
-            continue
-        if msg.get("title", "") in BOT_TITLES:
-            continue
-        t = msg.get("time", 0)
-        if t > newest:
-            newest = t
-            cmd_text = msg.get("message", "").strip().lower()
-
-    result = cmd_text if (newest > last_cmd_time and primed) else None
-    last_cmd_time = newest
-    primed = True
-    return result
-
-
-def ota_update():
-    base = "https://raw.githubusercontent.com/{}/{}/{}/".format(
-        GITHUB_USER, GITHUB_REPO, GITHUB_BRANCH)
-    for fn in OTA_FILES:
-        try:
-            r = requests.get(base + fn)
-            code = r.status_code
-            text = r.text if code == 200 else ""
-            r.close()
-        except Exception as e:
-            print("OTA download error:", fn, e)
-            return False
-        gc.collect()
-        if code != 200 or len(text) == 0:
-            print("OTA bad download:", fn, code)
-            return False
-        try:
-            with open(fn + ".new", "w") as f:
-                f.write(text)
-        except Exception as e:
-            print("OTA write error:", fn, e)
-            return False
-    for fn in OTA_FILES:
-        try:
-            try:
-                os.remove(fn + ".bak")
-            except OSError:
-                pass
-            try:
-                os.rename(fn, fn + ".bak")
-            except OSError:
-                pass
-            os.rename(fn + ".new", fn)
-            print("Updated:", fn)
-        except Exception as e:
-            print("OTA swap error:", fn, e)
-            return False
-    return True
-
-
-def temp_to_index(temp):
-    fraction = (temp - TEMP_MIN) / (TEMP_MAX - TEMP_MIN)
-    index = round(fraction * (LED_COUNT - 1))
-    if index < 0:
-        index = 0
-    if index > LED_COUNT - 1:
-        index = LED_COUNT - 1
-    return index
-
-
-def index_to_colour(index):
-    third = LED_COUNT / 3
-    if index < third:
-        return (0, 0, 40)
-    elif index < third * 2:
-        return (0, 40, 0)
-    else:
-        return (40, 0, 0)
-
-
-def draw_labels():
-    lcd.clear()
-    lcd.putstr("Temp:")
-    lcd.move_to(0, 1)
-    lcd.putstr("Humidity:")
-
-
-def enter_night_mode():
-    strand.fill((0, 0, 0))
-    strand.write()
-    lcd.clear()
-    lcd.display_off()
-    lcd.backlight_off()
-    print("Night mode ON")
-
-
-def exit_night_mode():
-    lcd.backlight_on()
-    lcd.display_on()
-    draw_labels()
-    print("Night mode OFF")
-
-
-def check_button():
-    global last_btn, last_toggle, night_mode
-    val = rp2.bootsel_button()
-    now_ms = time.ticks_ms()
-    if last_btn == 0 and val == 1:
-        if time.ticks_diff(now_ms, last_toggle) > 300:
-            last_toggle = now_ms
-            night_mode = not night_mode
-            if night_mode:
-                enter_night_mode()
+        reversed_text = text[::-1]
+        self.lcd.move_to(0, physical_row)
+        for ch in reversed_text:
+            if ch == ' ':
+                self.lcd.putstr(' ')
             else:
-                exit_night_mode()
-    last_btn = val
-
-
-def responsive_wait(ms):
-    start = time.ticks_ms()
-    while time.ticks_diff(time.ticks_ms(), start) < ms:
-        check_button()
-        time.sleep_ms(20)
-
-
-# --- Start up ---
-lcd.clear()
-lcd.putstr("Connecting WiFi")
-connect_wifi()
-sync_time()
-ensure_log_header()
-draw_labels()
-
-last_notify = 0
-last_poll = 0
-last_log = 0
-
-while True:
-
-    measurements = dht20.measurements
-    temp = measurements['t']
-    humidity = measurements['rh']
-
-    if not night_mode:
-        lcd.move_to(10, 0)
-        lcd.putstr(f"{temp:.1f} ")
-        lcd.move_to(10, 1)
-        lcd.putstr(f"{humidity:.1f} ")
-        index = temp_to_index(temp)
-        strand.fill((0, 0, 0))
-        strand[index] = index_to_colour(index)
-        strand.write()
-
-    now = time.time()
-
-    if now - last_log >= LOG_EVERY_SECONDS:
-        log_reading(round(temp, 1), round(humidity, 1))
-        last_log = now
-
-    if now - last_notify >= NOTIFY_EVERY_MINUTES * 60:
-        publish_reading(round(temp, 1), round(humidity, 1))
-        last_notify = now
-
-    if now - last_poll >= POLL_EVERY_SECONDS:
-        last_poll = now
-        cmd = get_new_command()
-        if cmd is not None:
-            if "update" in cmd:
-                notify_text("Updating from GitHub...")
-                if ota_update():
-                    notify_text("Update OK - rebooting")
-                    time.sleep(1)
-                    machine.reset()
-                else:
-                    notify_text("Update failed - still running old version")
-            else:
-                publish_reading(round(temp, 1), round(humidity, 1),
-                                title="Reading (on request)")
-
-    responsive_wait(2000)
+                self.lcd.putchar(chr(self._slot_map[ch]))
