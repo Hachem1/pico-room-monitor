@@ -277,7 +277,7 @@ def draw_flipped_reading(temp, humidity):
     line = "T{:.0f}C H{:.0f}%".format(temp, humidity)
     try:
         flipped_lcd.write_flipped_row(line, 1)
-    except ValueError as e:
+    except Exception as e:
         print("Flipped LCD render skipped:", e)
 
 
