@@ -35,7 +35,7 @@ LOG_EVERY_SECONDS = 60               # log a reading once a minute
 TZ_OFFSET_HOURS = 1                  # London: 1 in summer (BST), 0 in winter (GMT)
 
 # OTA - point these at YOUR public GitHub repo
-GITHUB_USER = "YOUR_GITHUB_USERNAME"
+GITHUB_USER = "Hachem1"
 GITHUB_REPO = "pico-room-monitor"
 GITHUB_BRANCH = "main"
 OTA_FILES = ["main.py"]              # files to pull when you send "update"
