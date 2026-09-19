@@ -16,15 +16,29 @@ CSV logging, a night-mode button, and over-the-air updates from this repo.
 - `lcd_api.py` ......... LCD driver
 - `pico_i2c_lcd.py` .... LCD I2C driver
 - `dht20.py` ........... sensor driver
-- `lcd_flip_helpers.py` . optional helper for a physically upside-down LCD
-  (not wired into `main.py` - only needed if you mount the LCD flipped)
+- `lcd_flip_helpers.py` . software 180-degree character flip, for when the
+  LCD is physically mounted upside down (pulled by OTA `update` alongside
+  `main.py`)
 
 ## Setup
 1. Flash MicroPython for the **Pico 2 W**.
 2. Copy all the files above onto the Pico.
 3. Create `secrets.py` on the Pico from the template and fill in your details.
 4. Edit `GITHUB_USER` / `GITHUB_REPO` at the top of `main.py`.
-5. Save `main.py` and let it run.
+5. Set `LCD_FLIPPED` in `main.py` to match how the LCD is physically
+   mounted (`True` if upside down).
+6. Save `main.py` and let it run.
+
+### LCD mounted upside down
+When `LCD_FLIPPED = True`, the reading is drawn with `lcd_flip_helpers.py`'s
+software character flip, in a compact `T25C H66%` format on one line -
+that module's font only covers digits, `.`, `:`, `-`, `%`, `C`, `T`, `H`, so
+it can't render the full "Temp:"/"Humidity:" labels or the "Connecting
+WiFi" boot message (which stays unflipped and upside-down for those few
+seconds at startup). Only 8 custom-character slots exist on the LCD
+controller, which is why both readings share one compact line instead of
+one line each - splitting them across both physical rows risks the two
+lines fighting over those 8 slots and corrupting each other's digits.
 
 ## Controls
 - **Onboard BOOTSEL button**: toggles night mode (LED + LCD off).
