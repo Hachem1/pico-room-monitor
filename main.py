@@ -1,4 +1,4 @@
-from machine import I2C, Pin, ADC
+from machine import I2C, Pin, ADC, WDT
 from lcd_api import LcdApi
 from pico_i2c_lcd import I2cLcd
 from dht20 import DHT20
@@ -100,6 +100,14 @@ therm1_adc = ADC(THERM1_ADC_PIN)
 therm1_digital = Pin(THERM1_DIGITAL_PIN, Pin.IN)
 therm2_adc = ADC(THERM2_ADC_PIN)
 
+# Hardware watchdog: if the WiFi chip wedges after a reset (a known Pico W
+# quirk - it can hang inside wlan.active()/wlan.connect() at the driver
+# level, below anything a try/except can catch) or anything else stalls the
+# loop, this forces a full hard reset instead of freezing forever. 8000ms is
+# close to the RP2040/2350 hardware maximum - call wdt.feed() often, from
+# anywhere that might block for a while, or it'll reset during normal use.
+wdt = WDT(timeout=8000)
+
 # --- State ---
 night_mode = False
 last_btn = 0
@@ -115,11 +123,13 @@ last_therm_alert_active = False
 
 
 def connect_wifi():
+    wdt.feed()
     wlan.active(True)
     if wlan.isconnected():
         return True
     wlan.connect(WIFI_SSID, WIFI_PASSWORD)
     for _ in range(20):
+        wdt.feed()
         if wlan.isconnected():
             print("WiFi connected:", wlan.ifconfig()[0])
             return True
@@ -355,6 +365,7 @@ def check_button():
 def responsive_wait(ms):
     start = time.ticks_ms()
     while time.ticks_diff(time.ticks_ms(), start) < ms:
+        wdt.feed()
         check_button()
         time.sleep_ms(20)
 
@@ -373,6 +384,8 @@ last_log = 0
 last_page_switch = time.time()
 
 while True:
+
+    wdt.feed()
 
     measurements = dht20.measurements
     temp = measurements['t']
