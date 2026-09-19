@@ -2,3 +2,4 @@ secrets.py
 templog.csv
 *.bak
 *.new
+__pycache__/
