@@ -1,6 +1,7 @@
 from machine import I2C, Pin
 from lcd_api import LcdApi
 from pico_i2c_lcd import I2cLcd
+from lcd_flip_helpers import FlippedLcdWriter
 from dht20 import DHT20
 from neopixel import NeoPixel
 import network
@@ -37,7 +38,7 @@ TZ_OFFSET_HOURS = 1                  # London: 1 in summer (BST), 0 in winter (G
 GITHUB_USER = "Hachem1"
 GITHUB_REPO = "pico-room-monitor"
 GITHUB_BRANCH = "main"
-OTA_FILES = ["main.py"]              # files to pull when you send "update"
+OTA_FILES = ["main.py", "lcd_flip_helpers.py"]  # files to pull when you send "update"
 # ----------------------------------------
 
 
@@ -59,9 +60,17 @@ LED_COUNT = 15        # 15 for the strand, 12 for the ring
 TEMP_MIN = 18
 TEMP_MAX = 32
 
+# Set to True if the LCD is physically mounted upside down. lcd_flip_helpers
+# only has glyphs for digits, ".", ":", "-", "%", "C", "T", "H" - so the
+# flipped reading uses a short "T25C H66%" format instead of the full
+# "Temp:"/"Humidity:" labels, and the "Connecting WiFi" boot message stays
+# unflipped (it's brief and out of that character set).
+LCD_FLIPPED = True
+
 # --- Set up hardware ---
 i2c = I2C(I2C_BUS, sda=Pin(SDA), scl=Pin(SCL), freq=400000)
 lcd = I2cLcd(i2c, LCD_ADDR, LCD_NUM_ROWS, LCD_NUM_COLS)
+flipped_lcd = FlippedLcdWriter(lcd, num_cols=LCD_NUM_COLS)
 dht20 = DHT20(TEMP_ADDR, i2c)
 strand = NeoPixel(Pin(LED_PIN), LED_COUNT)
 wlan = network.WLAN(network.STA_IF)
@@ -243,6 +252,25 @@ def draw_labels():
     lcd.putstr("Humidity:")
 
 
+def prepare_lcd_screen():
+    if LCD_FLIPPED:
+        lcd.clear()  # flipped mode redraws the whole reading line each loop
+    else:
+        draw_labels()
+
+
+def draw_flipped_reading(temp, humidity):
+    # Rounded to whole numbers, with no ":" label, so this always fits in
+    # the 8-glyph CGRAM budget (see lcd_flip_helpers.py) even in the worst
+    # case of every digit being different. Falls back to skipping this
+    # update rather than crashing the loop on any unexpected character.
+    line = "T{:.0f}C H{:.0f}%".format(temp, humidity)
+    try:
+        flipped_lcd.write_flipped_row(line, 1)
+    except Exception as e:
+        print("Flipped LCD render skipped:", e)
+
+
 def enter_night_mode():
     strand.fill((0, 0, 0))
     strand.write()
@@ -255,7 +283,7 @@ def enter_night_mode():
 def exit_night_mode():
     lcd.backlight_on()
     lcd.display_on()
-    draw_labels()
+    prepare_lcd_screen()
     print("Night mode OFF")
 
 
@@ -283,11 +311,11 @@ def responsive_wait(ms):
 
 # --- Start up ---
 lcd.clear()
-lcd.putstr("Connecting WiFi")
+lcd.putstr("Connecting WiFi")  # shown unflipped - brief, and outside the flip font's character set
 connect_wifi()
 sync_time()
 ensure_log_header()
-draw_labels()
+prepare_lcd_screen()
 
 last_notify = 0
 last_poll = 0
@@ -300,10 +328,13 @@ while True:
     humidity = measurements['rh']
 
     if not night_mode:
-        lcd.move_to(10, 0)
-        lcd.putstr(f"{temp:.1f} ")
-        lcd.move_to(10, 1)
-        lcd.putstr(f"{humidity:.1f} ")
+        if LCD_FLIPPED:
+            draw_flipped_reading(temp, humidity)
+        else:
+            lcd.move_to(10, 0)
+            lcd.putstr(f"{temp:.1f} ")
+            lcd.move_to(10, 1)
+            lcd.putstr(f"{humidity:.1f} ")
         index = temp_to_index(temp)
         strand.fill((0, 0, 0))
         strand[index] = index_to_colour(index)
