@@ -17,6 +17,18 @@
 # labels short (e.g. "T" / "H" rather than "Temp:" / "Humidity:") if you
 # want them to share the budget with digits.
 #
+# CGRAM SLOTS ARE CACHED, NOT RELOADED EVERY CALL: this project's
+# lcd_api.py/pico_i2c_lcd.py calls gc.collect() after every single I2C
+# transaction, and custom_char() does 9 of those (1 command + 8 data bytes)
+# per glyph. Reloading a whole line's worth of glyphs (e.g. 7) on every
+# refresh means ~60+ forced garbage collections back to back, which can
+# block long enough to disrupt other time-sensitive things (like WiFi)
+# running on the same core. So a glyph already sitting in a slot from the
+# previous call is left alone - only characters that aren't currently
+# loaded anywhere get a fresh custom_char() call. Static characters (a
+# label's letters, units) end up loaded once and never touched again;
+# only the digits that actually change between calls cost anything.
+#
 # Requires your lcd_api.py to expose:
 #   lcd.custom_char(location, charmap)   # loads an 8-byte bitmap into CGRAM slot 0-7
 #   lcd.putchar(ch)                      # writes one raw character/byte
@@ -46,6 +58,8 @@ _FONT = {
     ' ': [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
 }
 
+_NUM_SLOTS = 8
+
 
 def _flip_glyph(bitmap):
     """180-degree rotate a 5x8 glyph: reverse row order top<->bottom, and
@@ -62,22 +76,35 @@ def _flip_glyph(bitmap):
 
 class FlippedLcdWriter:
     """
-    Dynamically manages the LCD's 8 CGRAM slots: for each line you want to
-    draw, it loads whichever flipped glyphs that line actually needs (up to
-    8 unique characters), then writes them in reverse order so the row reads
-    correctly once the physical LCD is mounted upside down.
+    Manages the LCD's 8 CGRAM slots across calls, reloading a glyph only
+    when it isn't already sitting in a slot - see the module docstring for
+    why that matters on this hardware. Writes flipped glyphs in reverse
+    column order per row, so the row reads correctly once the physical LCD
+    is mounted upside down.
     """
 
     def __init__(self, lcd, num_cols=16):
         self.lcd = lcd
         self.num_cols = num_cols
-        self._slot_map = {}
+        self._slot_map = {}  # char -> CGRAM slot, persists across calls
 
-    def _assign_slots(self, chars_needed):
-        self._slot_map = {}
-        for slot, ch in enumerate(chars_needed):
-            self.lcd.custom_char(slot, bytearray(_flip_glyph(_FONT[ch])))
-            self._slot_map[ch] = slot
+    def _ensure_slots_loaded(self, chars_needed):
+        needed = set(chars_needed)
+
+        # Free up slots held by characters this line no longer needs -
+        # anything still needed stays exactly where it is (no reload).
+        for ch in list(self._slot_map):
+            if ch not in needed:
+                del self._slot_map[ch]
+
+        used_slots = set(self._slot_map.values())
+        free_slots = [s for s in range(_NUM_SLOTS) if s not in used_slots]
+
+        for ch in chars_needed:
+            if ch not in self._slot_map:
+                slot = free_slots.pop(0)
+                self.lcd.custom_char(slot, bytearray(_flip_glyph(_FONT[ch])))
+                self._slot_map[ch] = slot
 
     def write_flipped_row(self, text, physical_row):
         """
@@ -96,14 +123,14 @@ class FlippedLcdWriter:
                     raise ValueError("No flipped glyph defined for %r" % ch)
                 unique_chars.append(ch)
 
-        if len(unique_chars) > 8:
+        if len(unique_chars) > _NUM_SLOTS:
             raise ValueError(
-                "Row needs %d distinct glyphs (%s) but only 8 CGRAM slots "
+                "Row needs %d distinct glyphs (%s) but only %d CGRAM slots "
                 "are available - shorten labels or reduce precision"
-                % (len(unique_chars), unique_chars)
+                % (len(unique_chars), unique_chars, _NUM_SLOTS)
             )
 
-        self._assign_slots(unique_chars)
+        self._ensure_slots_loaded(unique_chars)
 
         reversed_text = text[::-1]
         self.lcd.move_to(0, physical_row)
