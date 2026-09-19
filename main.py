@@ -66,6 +66,7 @@ TEMP_MAX = 32
 # "Temp:"/"Humidity:" labels, and the "Connecting WiFi" boot message stays
 # unflipped (it's brief and out of that character set).
 LCD_FLIPPED = True
+FLIP_REFRESH_SECONDS = 8  # how often to redraw the flipped line (cuts I2C load)
 
 # --- Set up hardware ---
 i2c = I2C(I2C_BUS, sda=Pin(SDA), scl=Pin(SCL), freq=400000)
@@ -320,16 +321,23 @@ prepare_lcd_screen()
 last_notify = 0
 last_poll = 0
 last_log = 0
+last_flip_refresh = 0
 
 while True:
 
     measurements = dht20.measurements
     temp = measurements['t']
     humidity = measurements['rh']
+    now = time.time()
 
     if not night_mode:
         if LCD_FLIPPED:
-            draw_flipped_reading(temp, humidity)
+            # Reloading up to 7 custom CGRAM glyphs over I2C every loop (~2s)
+            # is a lot more bus traffic than the plain-text update below -
+            # throttle it to cut that load.
+            if now - last_flip_refresh >= FLIP_REFRESH_SECONDS:
+                draw_flipped_reading(temp, humidity)
+                last_flip_refresh = now
         else:
             lcd.move_to(10, 0)
             lcd.putstr(f"{temp:.1f} ")
@@ -339,8 +347,6 @@ while True:
         strand.fill((0, 0, 0))
         strand[index] = index_to_colour(index)
         strand.write()
-
-    now = time.time()
 
     if now - last_log >= LOG_EVERY_SECONDS:
         log_reading(round(temp, 1), round(humidity, 1))
