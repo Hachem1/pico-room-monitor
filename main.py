@@ -1,4 +1,4 @@
-from machine import I2C, Pin, ADC, WDT
+from machine import I2C, Pin, WDT
 from lcd_api import LcdApi
 from pico_i2c_lcd import I2cLcd
 from dht20 import DHT20
@@ -10,7 +10,6 @@ import json
 import gc
 import os
 import rp2
-import math
 
 # Credentials live in secrets.py ON THE PICO (not in this repo)
 from secrets import WIFI_SSID, WIFI_PASSWORD, NTFY_TOPIC
@@ -43,7 +42,7 @@ OTA_FILES = ["main.py"]              # files to pull when you send "update"
 
 
 NTFY_URL = "https://ntfy.sh/" + NTFY_TOPIC
-BOT_TITLES = ("Room conditions", "Reading (on request)", "Pico", "Thermistor alert")
+BOT_TITLES = ("Room conditions", "Reading (on request)", "Pico")
 
 # --- LCD / sensor I2C config ---
 SDA = 14
@@ -60,45 +59,12 @@ LED_COUNT = 15        # 15 for the strand, 12 for the ring
 TEMP_MIN = 18
 TEMP_MAX = 32
 
-# --- Extra thermistor sensors ---
-# THERM1 = the LM393 comparator board (A0 = analog voltage, D0 = digital
-# threshold output flipped by the blue trimmer pot).
-# THERM2 = the bare 3-pin thermistor breakout (S = analog voltage only).
-THERM1_ADC_PIN = 26          # A0 -> GP26 / ADC0
-THERM1_DIGITAL_PIN = 16      # D0 -> GP16
-THERM2_ADC_PIN = 27          # S  -> GP27 / ADC1
-
-# NTC voltage-divider math. These are typical values for these common 10k
-# modules (fixed resistor on the VCC side, thermistor to GND, signal tapped
-# at the midpoint) - if readings come out backwards (falling as the room
-# warms up) or way off vs. the DHT20, that means your board is wired the
-# other way round or uses different part values: try flipping
-# THERM_ON_HIGH_SIDE below, or adjust NTC_R_SERIES/NTC_R25 to match a bench
-# reading against the DHT20.
-NTC_BETA = 3950
-NTC_R25_OHMS = 10000
-NTC_R_SERIES_OHMS = 10000
-NTC_T25_KELVIN = 298.15
-THERM_ON_HIGH_SIDE = False
-ADC_VREF = 3.3
-
-# D0 alert: fires an ntfy notification the moment the comparator trips.
-# Flip this if the alert fires when it shouldn't (or never fires) - it
-# depends on which way round your board's comparator is wired.
-THERM1_ALERT_ACTIVE_HIGH = True
-
-DISPLAY_CYCLE_SECONDS = 4    # how long each LCD page is shown before swapping
-
 # --- Set up hardware ---
 i2c = I2C(I2C_BUS, sda=Pin(SDA), scl=Pin(SCL), freq=400000)
 lcd = I2cLcd(i2c, LCD_ADDR, LCD_NUM_ROWS, LCD_NUM_COLS)
 dht20 = DHT20(TEMP_ADDR, i2c)
 strand = NeoPixel(Pin(LED_PIN), LED_COUNT)
 wlan = network.WLAN(network.STA_IF)
-
-therm1_adc = ADC(THERM1_ADC_PIN)
-therm1_digital = Pin(THERM1_DIGITAL_PIN, Pin.IN)
-therm2_adc = ADC(THERM2_ADC_PIN)
 
 # Hardware watchdog: if the WiFi chip wedges after a reset (a known Pico W
 # quirk - it can hang inside wlan.active()/wlan.connect() at the driver
@@ -114,12 +80,6 @@ last_btn = 0
 last_toggle = 0
 last_cmd_time = 0
 primed = False
-
-PAGE_DHT20 = 0
-PAGE_THERM = 1
-current_page = PAGE_DHT20
-last_page_switch = 0
-last_therm_alert_active = False
 
 
 def connect_wifi():
@@ -160,16 +120,11 @@ def ensure_log_header():
         open(LOG_FILE, "r").close()
     except OSError:
         with open(LOG_FILE, "w") as f:
-            f.write("timestamp,temp_c,humidity_pct,therm1_c,therm2_c\n")
+            f.write("timestamp,temp_c,humidity_pct\n")
 
 
-def _fmt_temp(temp):
-    return "{:.1f}".format(temp) if temp is not None else "NA"
-
-
-def log_reading(temp, humidity, therm1=None, therm2=None):
-    line = "{},{:.1f},{:.1f},{},{}\n".format(
-        timestamp(), temp, humidity, _fmt_temp(therm1), _fmt_temp(therm2))
+def log_reading(temp, humidity):
+    line = "{},{:.1f},{:.1f}\n".format(timestamp(), temp, humidity)
     try:
         with open(LOG_FILE, "a") as f:
             f.write(line)
@@ -291,41 +246,11 @@ def index_to_colour(index):
         return (40, 0, 0)
 
 
-def read_ntc_temp_c(adc):
-    """Convert one of the NTC thermistor boards' analog reading to Celsius.
-    Returns None right at the voltage rails, where the divider math blows up."""
-    raw = adc.read_u16()
-    voltage = raw / 65535 * ADC_VREF
-    if voltage <= 0.02 or voltage >= ADC_VREF - 0.02:
-        return None
-    if THERM_ON_HIGH_SIDE:
-        r_therm = NTC_R_SERIES_OHMS * voltage / (ADC_VREF - voltage)
-    else:
-        r_therm = NTC_R_SERIES_OHMS * (ADC_VREF - voltage) / voltage
-    inv_t = 1.0 / NTC_T25_KELVIN + (1.0 / NTC_BETA) * math.log(r_therm / NTC_R25_OHMS)
-    return (1.0 / inv_t) - 273.15
-
-
-def check_therm_alert(digital_value):
-    global last_therm_alert_active
-    tripped = bool(digital_value) if THERM1_ALERT_ACTIVE_HIGH else not bool(digital_value)
-    if tripped and not last_therm_alert_active:
-        notify_text("Thermistor threshold tripped (D0)", title="Thermistor alert")
-    last_therm_alert_active = tripped
-
-
-def draw_dht20_labels():
+def draw_labels():
     lcd.clear()
     lcd.putstr("Temp:")
     lcd.move_to(0, 1)
     lcd.putstr("Humidity:")
-
-
-def draw_therm_labels():
-    lcd.clear()
-    lcd.putstr("T1:")
-    lcd.move_to(0, 1)
-    lcd.putstr("T2:")
 
 
 def enter_night_mode():
@@ -338,12 +263,9 @@ def enter_night_mode():
 
 
 def exit_night_mode():
-    global current_page, last_page_switch
     lcd.backlight_on()
     lcd.display_on()
-    current_page = PAGE_DHT20
-    last_page_switch = time.time()
-    draw_dht20_labels()
+    draw_labels()
     print("Night mode OFF")
 
 
@@ -376,12 +298,11 @@ lcd.putstr("Connecting WiFi")
 connect_wifi()
 sync_time()
 ensure_log_header()
-draw_dht20_labels()
+draw_labels()
 
 last_notify = 0
 last_poll = 0
 last_log = 0
-last_page_switch = time.time()
 
 while True:
 
@@ -391,41 +312,20 @@ while True:
     temp = measurements['t']
     humidity = measurements['rh']
 
-    therm1_temp = read_ntc_temp_c(therm1_adc)
-    therm2_temp = read_ntc_temp_c(therm2_adc)
-    check_therm_alert(therm1_digital.value())
-
-    now = time.time()
-
     if not night_mode:
-        if now - last_page_switch >= DISPLAY_CYCLE_SECONDS:
-            last_page_switch = now
-            current_page = PAGE_THERM if current_page == PAGE_DHT20 else PAGE_DHT20
-            if current_page == PAGE_DHT20:
-                draw_dht20_labels()
-            else:
-                draw_therm_labels()
-
-        if current_page == PAGE_DHT20:
-            lcd.move_to(10, 0)
-            lcd.putstr(f"{temp:.1f} ")
-            lcd.move_to(10, 1)
-            lcd.putstr(f"{humidity:.1f} ")
-        else:
-            lcd.move_to(3, 0)
-            lcd.putstr(_fmt_temp(therm1_temp) + "C ")
-            lcd.move_to(10, 0)
-            lcd.putstr("HOT" if therm1_digital.value() else "ok ")
-            lcd.move_to(3, 1)
-            lcd.putstr(_fmt_temp(therm2_temp) + "C ")
-
+        lcd.move_to(10, 0)
+        lcd.putstr(f"{temp:.1f} ")
+        lcd.move_to(10, 1)
+        lcd.putstr(f"{humidity:.1f} ")
         index = temp_to_index(temp)
         strand.fill((0, 0, 0))
         strand[index] = index_to_colour(index)
         strand.write()
 
+    now = time.time()
+
     if now - last_log >= LOG_EVERY_SECONDS:
-        log_reading(round(temp, 1), round(humidity, 1), therm1_temp, therm2_temp)
+        log_reading(round(temp, 1), round(humidity, 1))
         last_log = now
 
     if now - last_notify >= NOTIFY_EVERY_MINUTES * 60:
