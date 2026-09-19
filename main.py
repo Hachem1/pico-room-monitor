@@ -108,6 +108,7 @@ def connect_wifi():
 
 
 def sync_time():
+    wdt.feed()
     if ntptime is None:
         print("ntptime not available - timestamps may be wrong")
         return
@@ -143,6 +144,7 @@ def log_reading(temp, humidity):
 
 
 def notify_text(text, title="Pico"):
+    wdt.feed()
     try:
         if not wlan.isconnected():
             connect_wifi()
@@ -159,6 +161,7 @@ def publish_reading(temp, humidity, title="Room conditions"):
 
 def get_new_command():
     global last_cmd_time, primed
+    wdt.feed()
     url = NTFY_URL + "/json?poll=1&since=" + str(POLL_EVERY_SECONDS + 10) + "s"
     try:
         r = requests.get(url)
@@ -199,6 +202,7 @@ def ota_update():
     base = "https://raw.githubusercontent.com/{}/{}/{}/".format(
         GITHUB_USER, GITHUB_REPO, GITHUB_BRANCH)
     for fn in OTA_FILES:
+        wdt.feed()
         try:
             r = requests.get(base + fn)
             code = r.status_code
