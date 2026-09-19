@@ -1,7 +1,6 @@
-from machine import I2C, Pin, WDT
+from machine import I2C, Pin
 from lcd_api import LcdApi
 from pico_i2c_lcd import I2cLcd
-from lcd_flip_helpers import FlippedLcdWriter
 from dht20 import DHT20
 from neopixel import NeoPixel
 import network
@@ -38,7 +37,7 @@ TZ_OFFSET_HOURS = 1                  # London: 1 in summer (BST), 0 in winter (G
 GITHUB_USER = "Hachem1"
 GITHUB_REPO = "pico-room-monitor"
 GITHUB_BRANCH = "main"
-OTA_FILES = ["main.py", "lcd_flip_helpers.py"]  # files to pull when you send "update"
+OTA_FILES = ["main.py"]              # files to pull when you send "update"
 # ----------------------------------------
 
 
@@ -60,28 +59,12 @@ LED_COUNT = 15        # 15 for the strand, 12 for the ring
 TEMP_MIN = 18
 TEMP_MAX = 32
 
-# Set to True if the LCD is physically mounted upside down. lcd_flip_helpers
-# only has glyphs for digits, ".", ":", "-", "%", "C", "T", "H" - so the
-# flipped reading uses a short "T25C H66%" format instead of the full
-# "Temp:"/"Humidity:" labels, and the "Connecting WiFi" boot message stays
-# unflipped (it's brief and out of that character set).
-LCD_FLIPPED = True
-
 # --- Set up hardware ---
 i2c = I2C(I2C_BUS, sda=Pin(SDA), scl=Pin(SCL), freq=400000)
 lcd = I2cLcd(i2c, LCD_ADDR, LCD_NUM_ROWS, LCD_NUM_COLS)
-flipped_lcd = FlippedLcdWriter(lcd, num_cols=LCD_NUM_COLS)
 dht20 = DHT20(TEMP_ADDR, i2c)
 strand = NeoPixel(Pin(LED_PIN), LED_COUNT)
 wlan = network.WLAN(network.STA_IF)
-
-# Hardware watchdog: if the WiFi chip wedges after a reset (a known Pico W
-# quirk - it can hang inside wlan.active()/wlan.connect() at the driver
-# level, below anything a try/except can catch) or anything else stalls the
-# loop, this forces a full hard reset instead of freezing forever. 8000ms is
-# close to the RP2040/2350 hardware maximum - call wdt.feed() often, from
-# anywhere that might block for a while, or it'll reset during normal use.
-wdt = WDT(timeout=8000)
 
 # --- State ---
 night_mode = False
@@ -92,13 +75,11 @@ primed = False
 
 
 def connect_wifi():
-    wdt.feed()
     wlan.active(True)
     if wlan.isconnected():
         return True
     wlan.connect(WIFI_SSID, WIFI_PASSWORD)
     for _ in range(20):
-        wdt.feed()
         if wlan.isconnected():
             print("WiFi connected:", wlan.ifconfig()[0])
             return True
@@ -108,7 +89,6 @@ def connect_wifi():
 
 
 def sync_time():
-    wdt.feed()
     if ntptime is None:
         print("ntptime not available - timestamps may be wrong")
         return
@@ -144,7 +124,6 @@ def log_reading(temp, humidity):
 
 
 def notify_text(text, title="Pico"):
-    wdt.feed()
     try:
         if not wlan.isconnected():
             connect_wifi()
@@ -161,7 +140,6 @@ def publish_reading(temp, humidity, title="Room conditions"):
 
 def get_new_command():
     global last_cmd_time, primed
-    wdt.feed()
     url = NTFY_URL + "/json?poll=1&since=" + str(POLL_EVERY_SECONDS + 10) + "s"
     try:
         r = requests.get(url)
@@ -202,7 +180,6 @@ def ota_update():
     base = "https://raw.githubusercontent.com/{}/{}/{}/".format(
         GITHUB_USER, GITHUB_REPO, GITHUB_BRANCH)
     for fn in OTA_FILES:
-        wdt.feed()
         try:
             r = requests.get(base + fn)
             code = r.status_code
@@ -266,25 +243,6 @@ def draw_labels():
     lcd.putstr("Humidity:")
 
 
-def prepare_lcd_screen():
-    if LCD_FLIPPED:
-        lcd.clear()  # flipped mode redraws the whole reading line each loop
-    else:
-        draw_labels()
-
-
-def draw_flipped_reading(temp, humidity):
-    # Rounded to whole numbers, with no ":" label, so this always fits in
-    # the 8-glyph CGRAM budget (see lcd_flip_helpers.py) even in the worst
-    # case of every digit being different. Falls back to skipping this
-    # update rather than crashing the loop on any unexpected character.
-    line = "T{:.0f}C H{:.0f}%".format(temp, humidity)
-    try:
-        flipped_lcd.write_flipped_row(line, 1)
-    except Exception as e:
-        print("Flipped LCD render skipped:", e)
-
-
 def enter_night_mode():
     strand.fill((0, 0, 0))
     strand.write()
@@ -297,7 +255,7 @@ def enter_night_mode():
 def exit_night_mode():
     lcd.backlight_on()
     lcd.display_on()
-    prepare_lcd_screen()
+    draw_labels()
     print("Night mode OFF")
 
 
@@ -319,18 +277,17 @@ def check_button():
 def responsive_wait(ms):
     start = time.ticks_ms()
     while time.ticks_diff(time.ticks_ms(), start) < ms:
-        wdt.feed()
         check_button()
         time.sleep_ms(20)
 
 
 # --- Start up ---
 lcd.clear()
-lcd.putstr("Connecting WiFi")  # shown unflipped - brief, and outside the flip font's character set
+lcd.putstr("Connecting WiFi")
 connect_wifi()
 sync_time()
 ensure_log_header()
-prepare_lcd_screen()
+draw_labels()
 
 last_notify = 0
 last_poll = 0
@@ -338,20 +295,15 @@ last_log = 0
 
 while True:
 
-    wdt.feed()
-
     measurements = dht20.measurements
     temp = measurements['t']
     humidity = measurements['rh']
 
     if not night_mode:
-        if LCD_FLIPPED:
-            draw_flipped_reading(temp, humidity)
-        else:
-            lcd.move_to(10, 0)
-            lcd.putstr(f"{temp:.1f} ")
-            lcd.move_to(10, 1)
-            lcd.putstr(f"{humidity:.1f} ")
+        lcd.move_to(10, 0)
+        lcd.putstr(f"{temp:.1f} ")
+        lcd.move_to(10, 1)
+        lcd.putstr(f"{humidity:.1f} ")
         index = temp_to_index(temp)
         strand.fill((0, 0, 0))
         strand[index] = index_to_colour(index)
